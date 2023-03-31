@@ -31,18 +31,20 @@ pub struct GcsWriter {
 
     op: OpWrite,
     path: String,
-    upload_id: Option<String>,
-    parts: Vec<CompleteMultipartUploadRequestPart>,
+    upload_location: Option<String>,
+    already_uploaded_chunk: u64,
+    last_chunk_uploaded: bool
 }
 
 impl GcsWriter {
-    pub fn new(backend: GcsBackend, op: OpWrite, path: String, upload_id: Option<String>) -> Self {
+    pub fn new(backend: GcsBackend, op: OpWrite, path: String, upload_location: Option<String>) -> Self {
         GcsWriter {
             backend,
             op,
             path,
-            upload_id,
-            parts: vec![],
+            upload_location,
+            already_uploaded_chunk: 0,
+            last_chunk_uploaded: false,
         }
     }
 }
@@ -76,17 +78,17 @@ impl oio::Write for GcsWriter {
     }
 
     async fn append(&mut self, bs: Bytes) -> Result<()> {
-        let upload_id = self.upload_id.as_ref().expect(
+        let upload_id = self.upload_location.as_ref().expect(
             "Writer doesn't have upload id, but users trying to call append, must be buggy",
         );
-        // Google Cloud Storage requires part number must between [1..=10000]
-        let part_number = self.parts.len() + 1;
 
-        let mut req = self.backend.gcs_upload_part_request(
-            &self.path,
-            upload_id,
-            part_number,
-            Some(bs.len() as u64),
+        let chunk_size = bs.len() as u64;
+        let is_last_chunk = chunk_size / 256 / 1024 == 0;
+        let mut req = self.backend.gcs_upload_chunks_in_resumable_upload(
+            &self.upload_location.expect("Failed to get upload location").as_str(),
+            chunk_size,
+            self.already_uploaded_chunk,
+            is_last_chunk,
             AsyncBody::Bytes(bs),
         )?;
 
@@ -101,18 +103,9 @@ impl oio::Write for GcsWriter {
 
         match status {
             StatusCode::OK => {
-                let etag = parse_etag(resp.headers())?
-                    .ok_or_else(|| {
-                        Error::new(
-                            ErrorKind::Unexpected,
-                            "ETag not present in returning response",
-                        )
-                    })?
-                    .to_string();
-
-                self.parts
-                    .push(CompleteMultipartUploadRequestPart { part_number, etag });
-
+                if is_last_chunk {
+                    self.last_chunk_uploaded = true
+                }
                 Ok(())
             }
             _ => Err(parse_error(resp).await?),
@@ -120,15 +113,22 @@ impl oio::Write for GcsWriter {
     }
 
     async fn close(&mut self) -> Result<()> {
-        let upload_id = if let Some(upload_id) = &self.upload_id {
-            upload_id
+        if self.last_chunk_uploaded {
+            Ok(())
+        }
+
+        let upload_location = if let Some(upload_location) = &self.upload_location {
+            upload_location
         } else {
             return Ok(());
         };
 
         let resp = self
             .backend
-            .gcs_complete_multipart_upload(&self.path, upload_id, &self.parts)
+            .gcs_complete_resumable_upload(
+                self.upload_location.expect("Failed to get upload location").as_str(),
+                self.already_uploaded_chunk,
+            )
             .await?;
 
         let status = resp.status();
